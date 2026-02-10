@@ -1,0 +1,28 @@
+{
+  "name": "locationpingserv",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alexjonesmma9/LocationPingServ.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/alexjonesmma9/LocationPingServ/issues"
+  },
+  "homepage": "https://github.com/alexjonesmma9/LocationPingServ#readme",
+  "dependencies": {
+    "body-parser": "^2.2.2",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "uuid": "^13.0.0"
+  }
+}
