@@ -1,6 +1,5 @@
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
+const mongoose = require('mongoose');
 const { v4: uuidv4 } = require('uuid');
 const cors = require('cors');
 
@@ -12,6 +11,13 @@ app.use(cors());
 app.use(express.json());
 
 // ---------------------------------------------------------
+// CONFIGURATION / CREDENTIALS
+// ---------------------------------------------------------
+const PASSWORD_USER = process.env.PASSWORD_USER || 'Espan@1500$$';
+const PASSWORD_ADMIN = process.env.PASSWORD_ADMIN || 'Adm1nEsp@na#@';
+const MONGODB_URI = process.env.MONGODB_URI;
+
+// ---------------------------------------------------------
 // DATA STRUCTURES
 // ---------------------------------------------------------
 
@@ -19,45 +25,48 @@ app.use(express.json());
 // Map<username, { role: 'USER'|'ADMIN', token: string, lastSeen: number }>
 const users = new Map();
 
-// 2. Blacklist (Persistent/JSON)
-const BLACKLIST_FILE = path.join(__dirname, 'blacklist.json');
-let blacklist = []; // Array of strings (usernames)
+// 2. Blacklist (Persistent/MongoDB)
+// Schema Definition
+const blacklistSchema = new mongoose.Schema({
+    username: { type: String, required: true, unique: true }
+});
+const BlacklistUser = mongoose.model('BlacklistUser', blacklistSchema);
 
-// Load blacklist on startup
-try {
-    if (fs.existsSync(BLACKLIST_FILE)) {
-        const data = fs.readFileSync(BLACKLIST_FILE, 'utf8');
-        blacklist = JSON.parse(data);
-        console.log(`Loaded ${blacklist.length} blacklisted users.`);
-    } else {
-        // Initialize file if not exists
-        fs.writeFileSync(BLACKLIST_FILE, JSON.stringify([], null, 2));
+let blacklistCache = []; // Cached Array of strings (usernames)
+
+async function loadBlacklist() {
+    if (!mongoose.connection.readyState) return;
+    try {
+        const docs = await BlacklistUser.find({});
+        blacklistCache = docs.map(doc => doc.username);
+        console.log(`Loaded ${blacklistCache.length} blacklisted users from DB.`);
+    } catch (err) {
+        console.error('Failed to load blacklist:', err);
     }
-} catch (err) {
-    console.error('Failed to load blacklist:', err);
 }
 
-// 3. Pings List (In-Memory based on prompt implying standard but transient storage for switch)
+// 3. Pings List (In-Memory)
 // Array w/ objects: { id, x, y, z, label, dimension, expiresAt, type, author }
 let pings = [];
 
+
 // ---------------------------------------------------------
-// CONFIGURATION / CREDENTIALS
+// DB CONNECTION
 // ---------------------------------------------------------
-const PASSWORD_USER = process.env.PASSWORD_USER || 'Espan@1500$$';
-const PASSWORD_ADMIN = process.env.PASSWORD_ADMIN || 'Adm1nEsp@na#@';
+if (MONGODB_URI) {
+    mongoose.connect(MONGODB_URI)
+        .then(() => {
+            console.log('Connected to MongoDB');
+            loadBlacklist();
+        })
+        .catch(err => console.error('MongoDB connection error:', err));
+} else {
+    console.warn('WARNING: MONGODB_URI not set. Blacklist will be in-memory only (ephemeral).');
+}
 
 // ---------------------------------------------------------
 // HELPERS
 // ---------------------------------------------------------
-
-function saveBlacklist() {
-    try {
-        fs.writeFileSync(BLACKLIST_FILE, JSON.stringify(blacklist, null, 2));
-    } catch (err) {
-        console.error('Failed to save blacklist:', err);
-    }
-}
 
 function parseDuration(durationStr) {
     if (!durationStr) return 5 * 60 * 1000; // Default 5m
@@ -93,7 +102,7 @@ function authenticate(req, res, next) {
     if (!user) return res.status(401).json({ error: 'Invalid token' });
 
     // Late ban check
-    if (blacklist.includes(user.username)) {
+    if (blacklistCache.includes(user.username)) {
         return res.status(403).json({ error: 'User is blacklisted' });
     }
 
@@ -114,12 +123,11 @@ app.post('/api/auth/login', (req, res) => {
     const { username, password } = req.body;
 
     if (!username || !password) {
-        // Technically not specified, but good practice
         return res.status(400).json({ error: 'Missing credentials' });
     }
 
-    // Blacklist check
-    if (blacklist.includes(username)) {
+    // Check Cache
+    if (blacklistCache.includes(username)) {
         return res.status(403).json({ error: 'Forbidden' });
     }
 
@@ -145,8 +153,6 @@ app.post('/api/auth/login', (req, res) => {
 
 // 2. Pings (The "Switching" Logic)
 app.get('/api/pings', authenticate, (req, res) => {
-    // Already validated by middleware
-    // Return list of active pings
     res.json(pings);
 });
 
@@ -160,13 +166,9 @@ app.post('/api/pings', authenticate, (req, res) => {
             return res.status(403).json({ error: 'Only admins can post COORD pings' });
         }
     } else if (type === 'LOCATION') {
-        // Search existing pings where author == username AND type == LOCATION
-        // Delete them (Enforce "only one location ping per user")
+        // Enforce "only one location ping per user"
         pings = pings.filter(p => !(p.author === user.username && p.type === 'LOCATION'));
     } else {
-        // Unknown type - maybe reject or default? 
-        // Prompt implies these are the types. Let's start by defaulting to nothing or rejecting.
-        // I'll reject for safety.
         return res.status(400).json({ error: 'Invalid ping type. Must be LOCATION or COORD' });
     }
 
@@ -188,8 +190,8 @@ app.post('/api/pings', authenticate, (req, res) => {
     res.status(200).json(newPing);
 });
 
-// 3. Blacklist Management (Admin Only)
-app.post('/api/blacklist', authenticate, (req, res) => {
+// 3. Blacklist Management (Admin Only) --- ASYNC for DB
+app.post('/api/blacklist', authenticate, async (req, res) => {
     if (req.user.role !== 'ADMIN') {
         return res.status(403).json({ error: 'Admin required' });
     }
@@ -197,21 +199,31 @@ app.post('/api/blacklist', authenticate, (req, res) => {
     const { username } = req.body;
     if (!username) return res.status(400).json({ error: 'Username required' });
 
-    if (!blacklist.includes(username)) {
-        blacklist.push(username);
-        saveBlacklist();
+    if (!blacklistCache.includes(username)) {
+        // Update Cache
+        blacklistCache.push(username);
         
-        // Revoke any active sessions
+        // Update DB
+        if (mongoose.connection.readyState) {
+            try {
+                await BlacklistUser.create({ username });
+            } catch (err) {
+                console.error('Error adding to blacklist DB:', err);
+                // Continue anyway to reflect in cache
+            }
+        }
+        
+        // Revoke active session
         if (users.has(username)) {
             users.delete(username);
         }
         console.log(`User blacklisted: ${username}`);
     }
 
-    res.status(200).json({ success: true, blacklist });
+    res.status(200).json({ success: true, blacklist: blacklistCache });
 });
 
-app.delete('/api/blacklist', authenticate, (req, res) => {
+app.delete('/api/blacklist', authenticate, async (req, res) => {
     if (req.user.role !== 'ADMIN') {
         return res.status(403).json({ error: 'Admin required' });
     }
@@ -219,21 +231,31 @@ app.delete('/api/blacklist', authenticate, (req, res) => {
     const { username } = req.body;
     if (!username) return res.status(400).json({ error: 'Username required' });
 
-    const index = blacklist.indexOf(username);
+    const index = blacklistCache.indexOf(username);
     if (index !== -1) {
-        blacklist.splice(index, 1);
-        saveBlacklist();
+        // Update Cache
+        blacklistCache.splice(index, 1);
+
+        // Update DB
+        if (mongoose.connection.readyState) {
+            try {
+                await BlacklistUser.findOneAndDelete({ username });
+            } catch (err) {
+                console.error('Error removing from blacklist DB:', err);
+            }
+        }
+        
         console.log(`User un-blacklisted: ${username}`);
     }
 
-    res.status(200).json({ success: true, blacklist });
+    res.status(200).json({ success: true, blacklist: blacklistCache });
 });
 
 app.get('/api/blacklist', authenticate, (req, res) => {
     if (req.user.role !== 'ADMIN') {
         return res.status(403).json({ error: 'Admin required' });
     }
-    res.json(blacklist);
+    res.json(blacklistCache);
 });
 
 // 4. Deletion
@@ -248,9 +270,6 @@ app.delete('/api/pings/:id', authenticate, (req, res) => {
 
     const ping = pings[pingIndex];
 
-    // Logic:
-    // If Admin: Can delete any ping.
-    // If User: Can only delete pings where ping.author == user.username.
     if (user.role === 'ADMIN') {
         pings.splice(pingIndex, 1);
         return res.status(200).json({ success: true, message: 'Ping deleted by admin' });
@@ -267,22 +286,19 @@ app.delete('/api/pings/:id', authenticate, (req, res) => {
 // ---------------------------------------------------------
 // AUTO-EXPIRATION
 // ---------------------------------------------------------
-// Background task to remove pings where now > expiresAt
 setInterval(() => {
     const now = Date.now();
     const initialCount = pings.length;
     pings = pings.filter(p => p.expiresAt > now);
     const diff = initialCount - pings.length;
-    if (diff > 0) {
-        console.log(`Auto-removed ${diff} expired pings.`);
-    }
-}, 10000); // Check every 10 seconds
+    // Log occasionally if cleaning up
+    if (diff > 0) console.log(`Auto-removed ${diff} expired pings.`);
+}, 10000);
 
 // ---------------------------------------------------------
 // START SERVER
 // ---------------------------------------------------------
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
-    console.log(`Admin Password: ${PASSWORD_ADMIN}`);
-    console.log(`User Password: ${PASSWORD_USER}`);
+    if (!MONGODB_URI) console.log('Notice: Running in memory-only mode (No DB Connection).');
 });
